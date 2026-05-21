@@ -981,6 +981,8 @@ class Operation:
 
 @ir_dataclass
 class Loops(IRNode):
+    """Base class for pointwise and reduction loop-body IR nodes."""
+
     device: torch.device
     dtype: torch.dtype
     inner_fn: Callable[..., Any]
@@ -1064,7 +1066,15 @@ class Loops(IRNode):
     def has_large_inner_fn(self, threshold: int | None = None) -> bool:
         if threshold is None:
             threshold = 0
-        threshold = max(threshold, config.realize_opcount_threshold)
+        realize_opcount_threshold = config.realize_opcount_threshold
+        if realize_opcount_threshold is None:
+            if is_cpu(self):
+                realize_opcount_threshold = config.realize_cpu_opcount_threshold
+            else:
+                realize_opcount_threshold = config._realize_opcount_threshold_default
+        else:
+            assert isinstance(realize_opcount_threshold, int)
+        threshold = max(threshold, realize_opcount_threshold)
         return self.inner_fn_opcount().num_ops > threshold
 
     def inner_fn_free_symbols(self, unbacked_only: bool = False) -> OrderedSet[Symbol]:
@@ -9686,8 +9696,18 @@ class StorageBox(MutableBox):
         )
 
     def has_exceeded_max_reads(self) -> bool:
+        realize_acc_reads_threshold = config.realize_acc_reads_threshold
+        if realize_acc_reads_threshold is None:
+            if is_cpu(self.data):
+                realize_acc_reads_threshold = config.realize_cpu_acc_reads_threshold
+            else:
+                realize_acc_reads_threshold = (
+                    config._realize_acc_reads_threshold_default
+                )
+        else:
+            assert isinstance(realize_acc_reads_threshold, int)
         return isinstance(self.data, Pointwise) and (
-            self.num_reads() > config.realize_acc_reads_threshold
+            self.num_reads() > realize_acc_reads_threshold
             or self.has_large_inner_fn()
             or (
                 config.realize_acc_reads_size_threshold is not None
@@ -9706,7 +9726,7 @@ class StorageBox(MutableBox):
             if is_cpu(self.data):
                 # Heuristic for realizing reused result of heavy ops on cpu
                 opcount = self.data.inner_fn_opcount()
-                heavy_ops = ["exp", "sigmoid"]  # a list of heavy ops
+                heavy_ops = ["exp", "sigmoid", "tanh"]  # a list of heavy ops
                 if any(x in opcount.used_ops for x in heavy_ops):
                     return True
             return (
