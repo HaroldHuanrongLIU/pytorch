@@ -3038,6 +3038,49 @@ class GraphModule(torch.nn.Module):
         ep = torch.export.export(M(), args)
         self.assertEqual(ep.module()(*args), M()(*args))
 
+    def test_cond_branch_tensor_constant_run_decompositions(self):
+        def branch(x):
+            torch.tensor(0)
+            return x.clone()
+
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return torch.cond(x.any(), branch, branch, (x,))
+
+        ep = torch.export.export(M(), (torch.empty(()),))
+        decomp_ep = ep.run_decompositions()
+        inp = torch.ones(())
+        self.assertEqual(decomp_ep.module()(inp), M()(inp))
+
+        def assert_no_lifted_buffer_leak(decomp_ep):
+            self.assertEqual(dict(decomp_ep.state_dict), {})
+            self.assertEqual(decomp_ep.graph_signature.buffers, ())
+            for node, spec in zip(
+                decomp_ep.graph.find_nodes(op="placeholder"),
+                decomp_ep.graph_signature.input_specs,
+            ):
+                self.assertGreater(len(node.users), 0)
+                self.assertNotEqual(spec.kind, InputKind.BUFFER)
+
+        assert_no_lifted_buffer_leak(decomp_ep)
+
+        class UsedConstant(torch.nn.Module):
+            def forward(self, x):
+                def true_fn(x):
+                    return x + torch.tensor(2.0)
+
+                def false_fn(x):
+                    return x + torch.tensor(4.0)
+
+                return torch.cond(x.any(), true_fn, false_fn, (x,))
+
+        used_decomp_ep = torch.export.export(
+            UsedConstant(), (torch.ones(()),)
+        ).run_decompositions()
+        self.assertEqual(used_decomp_ep.module()(torch.ones(())), torch.tensor(3.0))
+        self.assertEqual(used_decomp_ep.module()(torch.zeros(())), torch.tensor(4.0))
+        assert_no_lifted_buffer_leak(used_decomp_ep)
+
     def test_state_tensors(self):
         class M(torch.nn.Module):  # simple with register buffer
             def __init__(self) -> None:
@@ -15877,7 +15920,6 @@ graph():
             str(ep.graph).strip(),
             """\
 graph():
-    %b_parametrizations_buffer_original0 : [num_users=0] = placeholder[target=b_parametrizations_buffer_original0]
     %b_parametrizations_buffer_original1 : [num_users=1] = placeholder[target=b_parametrizations_buffer_original1]
     %x : [num_users=2] = placeholder[target=x]
     %add_1 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %b_parametrizations_buffer_original1), kwargs = {})
@@ -15896,7 +15938,6 @@ graph():
                 str(ep.graph).strip(),
                 """\
 graph():
-    %b_parametrizations_buffer_original0 : [num_users=0] = placeholder[target=b_parametrizations_buffer_original0]
     %b_parametrizations_buffer_original1 : [num_users=1] = placeholder[target=b_parametrizations_buffer_original1]
     %x : [num_users=2] = placeholder[target=x]
     %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %b_parametrizations_buffer_original1), kwargs = {})
@@ -15908,7 +15949,6 @@ graph():
                 str(ep.graph).strip(),
                 """\
 graph():
-    %b_parametrizations_buffer_original0 : [num_users=0] = placeholder[target=b_parametrizations_buffer_original0]
     %b_parametrizations_buffer_original1 : [num_users=1] = placeholder[target=b_parametrizations_buffer_original1]
     %x : [num_users=2] = placeholder[target=x]
     %add_1 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %b_parametrizations_buffer_original1), kwargs = {})
