@@ -2919,7 +2919,14 @@ def _compile_fx_main(
         )
         fw_compiler = SerializableAOTDispatchCompiler(OutputCode, fw_compiler)
 
-        if config.freezing and not torch.is_grad_enabled():
+        # By default, preserve the legacy ambient-grad gate because freezing a
+        # graph reached from a grad-enabled caller can change parameter
+        # lifetime/semantics. The opt-in lets AOTAutograd freeze graphs that
+        # become inference-only after user code enters no_grad/inference_mode.
+        use_freezing_inference_compiler = config.freezing and (
+            not torch.is_grad_enabled() or config.freezing_traced_inference
+        )
+        if use_freezing_inference_compiler:
             inference_compiler: Callable[..., Any] = functools.partial(
                 fw_compiler_freezing,
                 dynamo_model=model_,
