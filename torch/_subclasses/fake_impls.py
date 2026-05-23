@@ -1629,13 +1629,30 @@ def bincount(
         # Without symints/symfloats, cannot handle this
         raise DynamicOutputShapeException(func)
 
-    new_size = fake_mode.shape_env.create_unbacked_symint()
+    from torch.fx.experimental.symbolic_shapes import (
+        _constrain_range_for_size,
+        has_free_symbols,
+    )
 
-    from torch.fx.experimental.symbolic_shapes import _constrain_range_for_size
+    if not has_free_symbols(inputs.numel()) and inputs.numel() == 0:
+        return inputs.new_empty(minlength, dtype=torch.int64)  # type: ignore[return]
+
+    new_size = fake_mode.shape_env.create_unbacked_symint()
 
     _constrain_range_for_size(new_size)
     torch._check(new_size >= minlength)
-    return inputs.new_empty(new_size)  # type: ignore[return]
+    if weights is None:
+        return inputs.new_empty(new_size, dtype=torch.int64)  # type: ignore[return]
+
+    if weights.device.type == "mps":
+        dtype = (
+            weights.dtype
+            if weights.dtype in (torch.float32, torch.int32, torch.float16)
+            else torch.int32
+        )
+    else:
+        dtype = weights.dtype if weights.dtype == torch.float32 else torch.float64
+    return weights.new_empty(new_size, dtype=dtype)  # type: ignore[return]
 
 
 @register_op_impl(torch.ops.aten._pack_padded_sequence.default)
