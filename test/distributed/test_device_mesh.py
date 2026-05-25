@@ -2033,6 +2033,24 @@ class CuTeLayoutTest(TestCase):
 class ProcessGroupOpaqueTypeTest(TestCase):
     """Test that ProcessGroup opaque type members are registered and exist on the class."""
 
+    def test_process_group_subclasses_opaque_base(self):
+        from torch._opaque_base import OpaqueBase, OpaqueBaseMeta
+        from torch.distributed.device_mesh import _register_distributed_opaque_types
+
+        _register_distributed_opaque_types()
+
+        self.assertTrue(issubclass(ProcessGroup, OpaqueBase))
+        self.assertIsInstance(ProcessGroup, OpaqueBaseMeta)
+        self.assertIsInstance(ProcessGroup(0, 1), OpaqueBase)
+
+    def test_process_group_python_subclass_must_initialize_pybind_base(self):
+        class BadProcessGroup(ProcessGroup):
+            def __init__(self):
+                pass
+
+        with self.assertRaisesRegex(TypeError, "must be called"):
+            BadProcessGroup()
+
     def test_registered_members_exist_on_process_group(self):
         from torch._library.opaque_object import get_member_type
 
