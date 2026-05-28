@@ -6899,7 +6899,7 @@ def var_mean_sum_(x, axis, correction, keepdim, return_mean):
     return x_var, x_mean
 
 
-def use_two_step_variance(x, axis, keepdim):
+def use_two_step_variance(x, axis, keepdim, *, max_reduction_numel=None):
     # two-step algorithm can get better performance in small reductions size
     # while it can accumulate more numerical error than Welford algorithm.
     axis = _validate_reduction_axis(x, axis)
@@ -6916,11 +6916,35 @@ def use_two_step_variance(x, axis, keepdim):
         # 1024 is a default value to pass all the UTs about accuracy.
         # A larger threshold can still get performance benefits.
         threshold = config.cpp.use_two_step_variance_threshold
-    return (
-        isinstance(reduction_numel, sympy.Integer)
-        and int(reduction_numel) <= threshold
-        and sympy_product(ranges) != 1
+    if not isinstance(reduction_numel, sympy.Integer):
+        return False
+    reduction_numel = int(reduction_numel)
+    if max_reduction_numel is not None and reduction_numel > max_reduction_numel:
+        return False
+    return reduction_numel <= threshold and sympy_product(ranges) != 1
+
+
+def preserve_welford_mean(x, axis, keepdim):
+    device = x.get_device()
+    if device is None or device.type != "cpu" or not keepdim:
+        return False
+
+    current_node = V.graph.current_node
+    original_aten = (
+        current_node.meta.get("original_aten")
+        if current_node is not None and current_node.meta is not None
+        else None
     )
+    # native_group_norm's CPU affine path consumes this mean, so keep Welford
+    # across the two-step threshold to match native RowwiseMoments.
+    if (
+        isinstance(original_aten, torch._ops.OpOverload)
+        and original_aten._schema.name == "aten::native_group_norm"
+        and original_aten._overloadname == "default"
+    ):
+        return True
+
+    return use_two_step_variance(x, axis=axis, keepdim=keepdim, max_reduction_numel=64)
 
 
 def var_mean_welford_(x, axis, *, correction, keepdim, return_mean):
@@ -6977,12 +7001,15 @@ def var_mean_helper_(x, *, axis, correction, keepdim, return_mean):
         keepdim=keepdim,
         return_mean=return_mean,
     )
+    use_two_step = use_two_step_variance(x, axis=axis, keepdim=keepdim)
+    # Preserve eager var_mean's Welford-style mean for native norm patterns
+    # where small rounding differences can be amplified by downstream
+    # clamp/log operations.
+    if return_mean and use_two_step and preserve_welford_mean(x, axis, keepdim):
+        use_two_step = False
     output = (
         var_mean_sum_(**kwargs)
-        if (
-            config.mtia.disable_welford_reduction
-            or use_two_step_variance(x, axis=axis, keepdim=keepdim)
-        )
+        if (config.mtia.disable_welford_reduction or use_two_step)
         else var_mean_welford_(**kwargs)
     )
     output = tuple(to_dtype(x, out_dtype, copy=False) for x in output)
@@ -7759,12 +7786,18 @@ def addcmul(self, tensor1, tensor2, *, value=1):
     t1_loader = tensor1.make_loader()
     t2_loader = tensor2.make_loader()
 
-    # FMA/mul_rn/div_rn are only available for floating-point types on CUDA (non-AMD)
+    # mul_rn/div_rn are only available for floating-point types on CUDA/XPU.
+    # CPU addcmul(value=1) still uses FMA to match native addcmul semantics.
     device = self.get_device()
     use_fma = (
         dtype.is_floating_point
         and device is not None
         and device.type in ["cuda", "xpu"]
+    )
+    use_fma_for_value_one = use_fma or (
+        dtype in [torch.float32, torch.float64]
+        and device is not None
+        and device.type == "cpu"
     )
 
     def inner_fn(idx):
@@ -7772,7 +7805,7 @@ def addcmul(self, tensor1, tensor2, *, value=1):
         t1_val = t1_loader(idx)
         t2_val = t2_loader(idx)
 
-        if value == 1 and use_fma:
+        if value == 1 and use_fma_for_value_one:
             return ops.fma(t1_val, t2_val, self_val)
 
         # Match eager order: self + value * (tensor1 * tensor2)

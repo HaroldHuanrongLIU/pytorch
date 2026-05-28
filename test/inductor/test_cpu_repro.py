@@ -4909,6 +4909,70 @@ class CPUReproTests(TestCase):
                         "__at_align__ std::array", 0, exactly=True
                     ).run(code)
 
+    @config.patch(force_disable_caches=True)
+    def test_group_norm_affine_decomp_precision(self):
+        torch.manual_seed(0)
+        bn = nn.BatchNorm1d(10).eval()
+        elu = nn.ELU()
+        gn = nn.GroupNorm(10, 10).eval()
+
+        def make_model(length):
+            def model():
+                x = torch.ones([6, 10, length])
+                t = bn(x)
+                t = elu(t)
+                t = gn(t)
+                return torch.log(torch.clamp(t, min=1e-6))
+
+            return model
+
+        def make_bias_only_model(length, bias):
+            def bias_only_model():
+                x = torch.ones([6, 10, length])
+                t = bn(x)
+                t = elu(t)
+                t = F.group_norm(t, 10, weight=None, bias=bias)
+                return torch.log(torch.clamp(t, min=1e-6))
+
+            return bias_only_model
+
+        cases = (
+            make_model(12),
+            make_model(80),
+            make_bias_only_model(12, torch.zeros(10)),
+            make_bias_only_model(80, torch.zeros(10)),
+        )
+        for fn in cases:
+            expected = fn()
+            actual = torch.compile(fn, backend="inductor", fullgraph=True)()
+            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+    @config.patch(force_disable_caches=True)
+    def test_addcmul_value_one_fma_precision(self):
+        x = torch.full((16,), 8193.0, dtype=torch.float32)
+        y = torch.full((16,), 8193.0, dtype=torch.float32)
+        z = torch.full((16,), -67125248.0, dtype=torch.float32)
+
+        def fn(z, x, y):
+            return torch.addcmul(z, x, y, value=1)
+
+        expected = fn(z, x, y)
+        self.assertFalse(torch.equal(expected, z + x * y))
+        actual = torch.compile(fn, backend="inductor", fullgraph=True)(z, x, y)
+        self.assertEqual(actual, expected)
+
+    @config.patch(force_disable_caches=True)
+    def test_layer_norm_4d_large_reduction_uses_two_step_variance(self):
+        def fn(x):
+            return F.layer_norm(x, x.shape[2:])
+
+        x = torch.randn(2, 3, 8, 10)
+        expected = fn(x)
+        compiled_fn = torch.compile(fn, backend="inductor", fullgraph=True)
+        actual, code = run_and_get_cpp_code(compiled_fn, x)
+        self.assertTrue(same(actual, expected))
+        self.assertNotIn("welford", code)
+
     @requires_vectorization
     @unittest.skipIf(not torch.backends.mkldnn.is_available(), "MKLDNN is not enabled")
     def test_group_norm_sum_conv1d_tail_reduction_store(self):
