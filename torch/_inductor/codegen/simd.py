@@ -499,6 +499,23 @@ class ComboKernelCodegenResult(NamedTuple):
     node_info_group: list[NodeInfo]
 
 
+def _combo_seed_max_configs(seed_kernel) -> int:
+    """Size-bucketed cap: 1 config for small subkernels, 2 for larger."""
+    if seed_kernel.inside_reduction:
+        rnumel = math.prod(
+            int(V.graph.sizevars.optimization_hint(tree.numel))
+            for tree in seed_kernel.range_trees
+            if tree.is_reduction
+        )
+        return 1 if rnumel <= config.combo_kernels_seed_small_rnumel else 2
+    total = math.prod(
+        int(V.graph.sizevars.optimization_hint(tree.numel))
+        for tree in seed_kernel.range_trees
+        if not tree.is_reduction
+    )
+    return 1 if total <= config.combo_kernels_seed_small_pointwise_total else 2
+
+
 class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     """
     Common base class for Triton/Halide codegen which both use flattened indexing rather than loop nests.
@@ -4528,8 +4545,14 @@ class SIMDScheduling(BaseScheduling):
                 return_configs=True,
             )
 
+        if config.combo_kernels_seed_autotune_cap:
+            configs = configs[: _combo_seed_max_configs(seed_kernel)]
         if len(configs) == 1:
             return configs[0]
+        # Stash for _bench_combo_seeds_inline so it can override the worker-
+        # built autotuner.configs without recomputing the cap or re-running
+        # the heuristic.
+        seed_kernel._combo_seed_capped_configs = configs
         return None
 
     @staticmethod
@@ -4586,9 +4609,16 @@ class SIMDScheduling(BaseScheduling):
         for slot_idx, src_named, seed_kernel in slot_to_source:
             if src_named not in source_to_autotuner:
                 handle = source_to_handle[src_named]
-                source_to_autotuner[src_named] = (
-                    handle.result() if hasattr(handle, "result") else handle
-                )
+                autotuner = handle.result() if hasattr(handle, "result") else handle
+                # Reuse the (already-capped) configs from _try_prepick_seed_
+                # config instead of recomputing the cap and re-trimming the
+                # worker-built list.  Safe -- the autotuner is unique per
+                # source (PyCodeCache dedup) and only used here; identical
+                # sources yield identical capped configs.
+                capped = getattr(seed_kernel, "_combo_seed_capped_configs", None)
+                if capped is not None and autotuner.configs is not None:
+                    autotuner.configs = capped
+                source_to_autotuner[src_named] = autotuner
             compiled.append((slot_idx, source_to_autotuner[src_named], seed_kernel))
 
         # Pin RNG so example-tensor generation is deterministic across
