@@ -82,6 +82,7 @@ from torch._dynamo.debug_utils import (
     NNModuleToString,
     NopInputReader,
     same_two_models,
+    UnsupportedNNModuleError,
 )
 from torch._dynamo.utils import clone_inputs, counters, same
 from torch._environment import is_fbcode
@@ -682,7 +683,12 @@ if "__compile_source__" in globals():
     if len(kernel_side_table.constant_args) > 0:
         model_str += f"{kernel_side_table_prefix}.constant_args={kernel_side_table.constant_args}\n"
 
-    model_str += NNModuleToString.convert(gm)
+    try:
+        model_str += NNModuleToString.convert(gm)
+    except UnsupportedNNModuleError:
+        # This string is also emitted as a best-effort trace artifact during
+        # normal compilation, so unsupported modules must not mask compile errors.
+        model_str += NNModuleToString.convert(gm, allow_unsafe_repr=True)
 
     writer = InputWriter(save_dir, stable_hash=stable_hash)
     # pyrefly: ignore [implicit-any]
