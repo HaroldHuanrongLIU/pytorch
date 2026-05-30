@@ -43,7 +43,7 @@ from torch.utils._triton import (
 )
 
 from ...utils._sympy.symbol import free_symbol_is_type, prefix_str, symbol_is_type, SymT
-from ...utils._sympy.value_ranges import ValueRanges
+from ...utils._sympy.value_ranges import bound_sympy, ValueRanges
 from .. import config, ir, metrics, utils
 from ..async_compile import AsyncCompile
 from ..codecache import code_hash, get_path, PyCodeCache, write_atomic
@@ -76,6 +76,7 @@ from ..utils import (
     get_bounds_index_expr,
     get_fused_kernel_name,
     get_kernel_metadata,
+    is_gpu,
     is_welford_reduction,
     Placeholder,
     prefix_is_pointwise,
@@ -210,6 +211,65 @@ def _materialize_trunc_to_float_expr(
         return node.func(*new_args)
 
     return rewrite_float_subexpr(expr)
+
+
+def _val_expressible_in_32_bits(val: Any) -> bool:
+    if getattr(val, "is_Boolean", False):
+        return True
+
+    if isinstance(val, sympy.Expr):
+        if not val.is_number:
+            return False
+        if val.is_Integer or val.is_Boolean:
+            val = int(val)
+        else:
+            val = float(val)
+
+    if isinstance(val, float):
+        return -(2**24) <= val <= 2**24
+
+    if isinstance(val, int):
+        iinfo = torch.iinfo(torch.int32)
+        return iinfo.min <= val <= iinfo.max
+
+    return False
+
+
+def _range_expressible_in_32_bits(bounds: ValueRanges[Any]) -> bool:
+    return _val_expressible_in_32_bits(bounds.lower) and _val_expressible_in_32_bits(
+        bounds.upper
+    )
+
+
+def _bound_triton_expr(expr: sympy.Expr) -> ValueRanges[Any]:
+    ranges: dict[sympy.Symbol, ValueRanges[Any]] = {}
+    for sym in expr.free_symbols:
+        if not isinstance(sym, sympy.Symbol):
+            continue
+        if node := V.kernel.range_tree_nodes.get(sym):
+            upper = node.length - 1
+            if isinstance(upper, sympy.Expr) and not upper.is_number:
+                upper = V.graph.sizevars.shape_env.bound_sympy(upper).upper
+            ranges[sym] = ValueRanges(0, upper)
+        elif symbol_is_type(sym, SymT.TMP):
+            ranges[sym] = V.kernel.cse.varname_map[sym.name].bounds
+    return bound_sympy(expr, ranges)
+
+
+def _integer_expr_requires_int64(expr: sympy.Expr) -> bool:
+    if expr.is_integer:
+        bounds = _bound_triton_expr(expr)
+        if getattr(bounds.lower, "is_infinite", False) or getattr(
+            bounds.upper, "is_infinite", False
+        ):
+            return True
+        if not _range_expressible_in_32_bits(bounds):
+            return True
+
+    return any(
+        isinstance(arg, sympy.Expr) and _integer_expr_requires_int64(arg)
+        for arg in expr.args
+    )
 
 
 class OpDtypeSupport:
@@ -1794,6 +1854,10 @@ class TritonOverrides(OpOverrides):
     def index_expr(cls, expr, dtype):
         raise NotImplementedError("ops.index_expr not implemented outside a kernel")
 
+    @classmethod
+    def value_expr(cls, expr, dtype):
+        raise NotImplementedError("ops.value_expr not implemented outside a kernel")
+
     @staticmethod
     def masked(mask, body, other):
         raise NotImplementedError("ops.masked not implemented outside a kernel")
@@ -2339,7 +2403,7 @@ class TritonKernelOverrides(TritonOverrides):
         return cls._shaped_constant(value, dtype, shape=shape)
 
     @classmethod
-    def index_expr(cls, expr, dtype):
+    def _prepare_expr_indexing(cls, expr, dtype):
         expr = _materialize_trunc_to_float_expr(expr, dtype)
         indexing = V.kernel.indexing(
             expr, block_ptr=False, tma_compatibility_checker=None
@@ -2351,7 +2415,35 @@ class TritonKernelOverrides(TritonOverrides):
             shape = indexing.expand_shape
         else:
             shape = TritonSymbols.get_block_shape(indexing.index)
+        return expr, indexing, shape
 
+    @classmethod
+    def _emit_expr_indexing(
+        cls,
+        expr,
+        indexing,
+        shape,
+        index_str,
+        cast_dtype,
+        output_dtype,
+        *,
+        use_compute_types,
+    ):
+        var = V.kernel.cse.generate(
+            V.kernel.compute,
+            cls.to_dtype(
+                f"({index_str})", cast_dtype, use_compute_types=use_compute_types
+            ),
+            dtype=output_dtype,
+            bounds=get_bounds_index_expr(expr),
+            shape=shape,
+        )
+        var.mask_vars = indexing.mask_vars
+        return var
+
+    @classmethod
+    def index_expr(cls, expr, dtype):
+        expr, indexing, shape = cls._prepare_expr_indexing(expr, dtype)
         # Our sympy expr printing casts to the current kernel index dtype.
         # we only respect non int32-int64 dtypes and otherwise use current kernel indexing dtype
         index_dtype = V.kernel.get_index_dtype_as_torch_dtype()
@@ -2400,6 +2492,138 @@ class TritonKernelOverrides(TritonOverrides):
 
         var.mask_vars = indexing.mask_vars
         return var
+
+    @classmethod
+    def value_expr(cls, expr, dtype):
+        """
+        Like :meth:`index_expr`, but honors ``dtype``. This is the right op when
+        the user explicitly requested ``dtype`` (e.g. ``arange(int64)``
+        whose result participates in tensor computation).
+        """
+        expr, indexing, shape = cls._prepare_expr_indexing(expr, dtype)
+        is_predicate = bool(
+            getattr(expr, "is_Boolean", False) or getattr(expr, "is_Relational", False)
+        )
+        index_dtype = V.kernel.get_index_dtype_as_torch_dtype()
+        operand_dtype = dtype
+        result_dtype = dtype
+        if is_predicate or dtype == torch.bool:
+            expr_requires_int64 = _integer_expr_requires_int64(expr)
+            operand_dtype = torch.int64 if expr_requires_int64 else index_dtype
+            if is_predicate:
+                result_dtype = torch.bool
+            elif expr.is_integer:
+                result_dtype = operand_dtype
+            else:
+                result_dtype = torch.float32
+        elif dtype.is_floating_point:
+            expr_requires_int64 = _integer_expr_requires_int64(expr)
+            if expr.is_integer:
+                operand_dtype = torch.int64 if expr_requires_int64 else index_dtype
+                result_dtype = operand_dtype
+            else:
+                result_dtype = upcast_compute_type(dtype)
+                operand_dtype = torch.int64 if expr_requires_int64 else result_dtype
+
+        index_str = cls._value_expr_index_str(indexing, operand_dtype)
+        var = cls._emit_expr_indexing(
+            expr,
+            indexing,
+            shape,
+            index_str,
+            result_dtype,
+            result_dtype,
+            use_compute_types=False,
+        )
+
+        if result_dtype != dtype:
+            var = V.kernel.cse.generate(
+                V.kernel.compute,
+                cls.to_dtype(
+                    var,
+                    dtype,
+                    src_dtype=result_dtype,
+                    use_compute_types=False,
+                ),
+                dtype=dtype,
+                shape=var.shape,
+            )
+            var.mask_vars = indexing.mask_vars
+        return var
+
+    @classmethod
+    def _value_expr_index_str(
+        cls, indexing: IndexingOptions, dtype: torch.dtype
+    ) -> str:
+        index = cls._cast_expr_vars_to(indexing.index, dtype)
+        index_dtype = V.kernel._index_dtype
+        V.kernel._index_dtype = dtype
+        try:
+            index_str = V.kernel.index_to_str(index)
+        finally:
+            V.kernel._index_dtype = index_dtype
+        if is_sympy_integer_like(indexing.index):
+            return f"tl.full({indexing.expand_str}, {index_str}, {triton_type(dtype)})"
+        if indexing.expand_str is not None:
+            return f"tl.broadcast_to({index_str}, {indexing.expand_str})"
+        return index_str
+
+    @classmethod
+    def _cast_expr_vars_to(cls, index: sympy.Expr, dtype: torch.dtype) -> sympy.Expr:
+        """
+        Emit CSE'd casts to ``dtype`` of each symbolic variable referenced
+        by ``index`` and return a new expression that references the casted
+        temporaries.
+
+        Casting at least one operand forces Triton to perform the surrounding
+        arithmetic at ``dtype``'s width, which is what callers want when the
+        expression participates in value computation rather than indexing.
+        """
+        replacements: dict[sympy.Symbol, sympy.Symbol] = {}
+        triton_dtype = triton_type(dtype)
+        scalar_int_types = (
+            SymT.INDEX,
+            SymT.PRECOMPUTED_SIZE,
+            SymT.SIZE,
+            SymT.UNBACKED_INT,
+        )
+        scalar_float_types = (SymT.FLOAT, SymT.UNBACKED_FLOAT)
+        for sym in sorted(index.free_symbols, key=operator.attrgetter("name")):
+            if not isinstance(sym, sympy.Symbol):
+                continue
+
+            if symbol_is_type(sym, scalar_float_types):
+                continue
+            if symbol_is_type(sym, scalar_int_types):
+                name = V.kernel.index_to_str(sym)
+                shape = ()
+                src_dtype = V.kernel.get_index_dtype_as_torch_dtype()
+            elif symbol_is_type(sym, TritonSymbols.block_types):
+                name = sym.name
+                shape = TritonSymbols.get_block_shape(sym)
+                src_dtype = V.kernel.get_index_dtype_as_torch_dtype()
+            elif symbol_is_type(sym, SymT.TMP):
+                src_var = V.kernel.cse.varname_map[sym.name]
+                shape = src_var.shape
+                src_dtype = src_var.dtype
+                name = sym.name
+            else:
+                continue
+            if is_integer_dtype(dtype) and src_dtype.is_floating_point:
+                continue
+            if src_dtype in (dtype, torch.bool):
+                continue
+
+            cast_var = V.kernel.cse.generate(
+                V.kernel.compute,
+                f"({name}).to({triton_dtype})",
+                dtype=dtype,
+                shape=shape,
+            )
+            replacements[sym] = sympy.Symbol(str(cast_var))
+        if not replacements:
+            return index
+        return sympy_subs(index, replacements)
 
     @staticmethod
     def masked(mask, body, other):
@@ -6932,6 +7156,17 @@ class TritonScheduling(SIMDScheduling):
         for node in scheduler.nodes:
             if isinstance(node, (SchedulerNode, FusedSchedulerNode)):
                 node.debug_device_str = debug_triton_code
+
+    def should_convert_index_expr_to_value_expr(self, node_schedule, kernel):
+        # Triton index_expr uses the kernel indexing dtype for integer
+        # expressions, so value uses need the value_expr split on every Triton
+        # accelerator backend using this scheduling path.
+        for node in node_schedule:
+            if isinstance(node, BaseSchedulerNode):
+                device = node.get_device()
+                if device is not None and is_gpu(device.type):
+                    return True
+        return False
 
     @classmethod
     def get_backend_features(cls, device: torch.device):

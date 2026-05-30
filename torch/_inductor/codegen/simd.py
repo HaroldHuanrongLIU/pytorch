@@ -44,7 +44,10 @@ if TYPE_CHECKING:
     from ..ir import IRNode
 
 from ..ops_handler import WrapperHandler
-from ..optimize_indexing import indexing_dtype_strength_reduction
+from ..optimize_indexing import (
+    convert_index_expr_to_value_expr,
+    indexing_dtype_strength_reduction,
+)
 from ..runtime.coordinate_descent_tuner import CoordescTuner
 from ..runtime.hints import DeviceProperties
 from ..runtime.runtime_utils import green_text, last_power_of_2, yellow_text
@@ -571,6 +574,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         self.min_xblock: int | None = None
         self.min_rblock: int | None = None
         self.saved_partial_accumulate: list[PartialAccumulate] = []
+        self._index_dtype = self.features.select_index_dtype()
 
     def codegen_template_body(
         self,
@@ -619,7 +623,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         raise NotImplementedError
 
     def get_index_dtype_as_torch_dtype(self) -> torch.dtype:
-        return self.features.select_index_dtype()
+        return self._index_dtype
 
     @property
     def index_dtype(self) -> str:
@@ -1974,6 +1978,13 @@ class SIMDScheduling(BaseScheduling):
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
+    def should_convert_index_expr_to_value_expr(
+        self,
+        node_schedule: list[NodeScheduleEntry],
+        kernel: SIMDKernel,
+    ) -> bool:
+        return False
+
     def can_fuse(self, node1, node2):
         """
         Hook called by Scheduler to determine if the Triton backend
@@ -3148,6 +3159,10 @@ class SIMDScheduling(BaseScheduling):
 
             kernel.finalize_indexing(all_indexing.keys())
 
+            convert_index_expr = self.should_convert_index_expr_to_value_expr(
+                node_schedule, kernel
+            )
+
             # Second pass to do codegen
             for node in node_schedule:
                 if node is DisableReduction:
@@ -3157,6 +3172,8 @@ class SIMDScheduling(BaseScheduling):
                 else:
                     # TODO - use split ranges ?
                     indexing_dtype_strength_reduction(node._body)
+                    if convert_index_expr:
+                        convert_index_expr_to_value_expr(node._body)
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
 
