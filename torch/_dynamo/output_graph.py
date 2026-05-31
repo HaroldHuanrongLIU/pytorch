@@ -2756,7 +2756,12 @@ class OutputGraph(OutputGraphCommon):
             root.add_nn_modules(sub_gms)  # type: ignore[arg-type]
 
             self.current_tracer._maybe_preserve_original_meta(tx, output_node)
-            if not config.do_not_emit_runtime_asserts:
+            emit_runtime_asserts = not config.do_not_emit_runtime_asserts
+            # Symbol lifting still needs runtime_assert's symbolic CSE even
+            # when strict export disables runtime assert emission.
+            if emit_runtime_asserts or (
+                self.export and config.lift_export_input_symbols
+            ):
                 # There is a rare scenario where codegen_suffix adds a new entry
                 # to self.nn_modules while `root` knows only about the
                 # nn_modules at the time of its creation. This causes failures
@@ -2772,6 +2777,7 @@ class OutputGraph(OutputGraphCommon):
                                 self.shape_env,
                                 name,
                                 export=self.export,
+                                emit_runtime_asserts=emit_runtime_asserts,
                             )
                     self.remove_unused_get_attr_nodes()
                     insert_deferred_runtime_asserts(
@@ -2779,6 +2785,7 @@ class OutputGraph(OutputGraphCommon):
                         self.shape_env,
                         name,
                         export=self.export,
+                        emit_runtime_asserts=emit_runtime_asserts,
                     )
             # NB: deferred runtime asserts can keep graphargs live, so make sure
             # those are inserted before pruning
@@ -4195,7 +4202,9 @@ class SubgraphTracer(fx.Tracer):
             # Also see NOTE: [Export inputs must be explicitly passed in]
             is_strict_export = self.is_export
             is_non_strict_export = torch.compiler.is_compiling()
-            if not is_strict_export and not is_non_strict_export:
+            if (is_strict_export and config.lift_export_input_symbols) or (
+                not is_strict_export and not is_non_strict_export
+            ):
                 if isinstance(example_value, torch.Tensor):
                     self._lift_basic_symbols(example_value, source)
                 elif isinstance(example_value, (list, tuple)):
