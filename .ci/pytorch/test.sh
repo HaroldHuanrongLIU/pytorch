@@ -1403,9 +1403,13 @@ test_inductor_torchbench_cpu_smoketest_perf(){
   mkdir -p "$TEST_REPORTS_DIR"
 
   test_inductor_set_cpu_affinity
-  MODELS_SPEEDUP_TARGET=benchmarks/dynamo/expected_ci_speedup_inductor_torchbench_cpu.csv
+  local models_speedup_target=benchmarks/dynamo/expected_ci_speedup_inductor_torchbench_cpu.csv
+  if [[ -n "${USE_ARC:-}" ]]; then
+    models_speedup_target=benchmarks/dynamo/expected_ci_speedup_inductor_torchbench_cpu_osdc.csv
+  fi
 
-  grep -v '^ *#' < "$MODELS_SPEEDUP_TARGET" | while IFS=',' read -r -a model_cfg
+  echo "Using CPU TorchBench smoketest targets from $models_speedup_target"
+  grep -v '^ *#' < "$models_speedup_target" | while IFS=',' read -r -a model_cfg
   do
     local model_name=${model_cfg[0]}
     local data_type=${model_cfg[2]}
@@ -1429,8 +1433,9 @@ test_inductor_torchbench_cpu_smoketest_perf(){
     fi
     cat "$output_name"
     # The threshold value needs to be actively maintained to make this check useful.
-    # Allow 1% variance for CPU perf to accommodate perf fluctuation
-    python benchmarks/dynamo/check_perf_csv.py -f "$output_name" -t "$speedup_target" -s 0.99
+    # Allow 1% variance for CPU perf to accommodate perf fluctuation.
+    # Fail on large improvements too so the baseline is updated promptly.
+    python benchmarks/dynamo/check_perf_csv.py -f "$output_name" -t "$speedup_target" -s 0.99 --fail-on-improvement
   done
 }
 
