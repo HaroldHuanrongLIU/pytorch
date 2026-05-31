@@ -113,6 +113,7 @@ from .eval_frame import (
     TorchPatcher,
 )
 from .exc import (
+    _UserAssertionError,
     augment_exc_message,
     BackendCompilerFailed,
     FailOnRecompileLimitHit,
@@ -2135,6 +2136,12 @@ def _compile(
                 e, compile_id
             )
             tracer_output = getattr(e, "_torch_dynamo_tracer_output", None)
+            if isinstance(e, _UserAssertionError):
+                raise AssertionError(*e.args).with_traceback(e.__traceback__) from None
+            if isinstance(
+                e, AssertionError
+            ) and not exc.assertion_error_originates_in_dynamo(e):
+                raise
             if isinstance(
                 e,
                 (
@@ -2142,7 +2149,6 @@ def _compile(
                     UserError,
                     TorchRuntimeError,
                     BackendCompilerFailed,
-                    AssertionError,
                     IndexError,  # dim out-of-range from canonicalize_dim/maybe_wrap_dim
                     ConstraintViolationError,
                     GuardOnDataDependentSymNode,
