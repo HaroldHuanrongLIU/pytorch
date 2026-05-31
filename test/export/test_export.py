@@ -364,6 +364,44 @@ class TestDynamismExpression(TestCase):
             dynamic_shapes=dynamic_shapes,
         )
 
+    def _check_export_slice_static_bound_crosses_dynamic_dim(self, indices):
+        dynamic_shapes = {"x": {1: Dim("len", min=0, max=13)}}
+        for index in indices:
+            with self.subTest(index=index):
+
+                class Slice(torch.nn.Module):
+                    def forward(self, x):
+                        return x[:, index]
+
+                for width in (3, 8):
+                    x = torch.randn(4, width)
+                    ep = export(
+                        Slice(),
+                        (x,),
+                        dynamic_shapes=dynamic_shapes,
+                        strict=False,
+                    )
+                    self.assertEqual(len(ep.range_constraints), 1)
+                    for new_width in (0, 3, 5, 8, 13):
+                        y = torch.randn(4, new_width)
+                        self.assertEqual(ep.module()(y), y[:, index])
+
+    def test_export_slice_static_bound_crosses_dynamic_dim(self):
+        self._check_export_slice_static_bound_crosses_dynamic_dim((slice(None, 5),))
+
+    @testing.expectedFailureTrainingIRToRunDecomp
+    @testing.expectedFailureTrainingIRToRunDecompNonStrict
+    def test_export_slice_static_bound_crosses_dynamic_dim_variants(self):
+        self._check_export_slice_static_bound_crosses_dynamic_dim(
+            (
+                slice(5, None),
+                slice(None, -5),
+                slice(-5, None),
+                slice(3, 5),
+                slice(-5, -2),
+            )
+        )
+
     def test_no_grad_param_inplace(self):
         class Foo(torch.nn.Module):
             def __init__(self):
@@ -4387,8 +4425,9 @@ def forward(self, causal_mask, fill_value):
         class Foo(torch.nn.Module):
             def forward(self, xs):
                 x, y = xs["data"][0]
+                assert x.shape[0] >= 8  # noqa: S101
                 assert y.shape[0] <= 32  # noqa: S101
-                return x[6:], y + 2
+                return x + 1, y + 2
 
         x, y = torch.randn(8), torch.randn(8)
 
@@ -13248,13 +13287,21 @@ graph():
         for z in zs:
             dynamic_shapes[z] = (Dim.DYNAMIC, Dim.DYNAMIC)
 
+        ep = export(m, (x, y, zs), dynamic_shapes=dynamic_shapes)
+        self.assertEqual(ep.module()(x, y, zs), m(x, y, zs))
+
+        x_valid = torch.randn(3, 5)
+        y_valid = torch.randn(3, 6)
+        zs_valid = [torch.randn(2, 5), torch.randn(4, 5)]
+        self.assertEqual(
+            ep.module()(x_valid, y_valid, zs_valid), m(x_valid, y_valid, zs_valid)
+        )
+
         with self.assertRaisesRegex(
-            torch._dynamo.exc.UserError,
-            r"Constraints violated.*\n.*"
-            r"You marked L\['y'\].size\(\)\[0\] as dynamic but your code specialized it to be a constant \(3\).*"
-            r"If you're using Dim.DYNAMIC, replace it with either Dim.STATIC or Dim.AUTO.",
+            AssertionError,
+            escape("Guard failed: min(3, x.size()[0]) == y.size()[0]"),
         ):
-            export(m, (x, y, zs), dynamic_shapes=dynamic_shapes)
+            ep.module()(torch.randn(5, 5), torch.randn(2, 6), zs)
 
     def test_unflatten_random_dag_const_preserving_3_1(self):
         class N2(torch.nn.Module):
@@ -16933,7 +16980,7 @@ def forward(self, x):
                 for node in ep.graph.nodes
             ].count(True)
             if private_api:
-                self.assertEqual(num_asserts, 6)
+                self.assertEqual(num_asserts, 3)
                 with self.assertRaisesRegex(
                     RuntimeError,
                     r"Runtime assertion failed for expression Eq\(Mod\(s27\*s77, s77 - 1\), 0\)",
