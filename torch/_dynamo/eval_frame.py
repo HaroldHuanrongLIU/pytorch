@@ -1083,14 +1083,31 @@ class _TorchDynamoContext:
             # due to additional overhead costs.
             prior = set_eval_frame(None)
             prior_error_on_nested_compile: bool | None = None
+            prior_isolated_fullgraph_count: int | None = None
+            prior_skip_reasons: list[str] | None = None
             fullgraph_count_enabled = False
+            fullgraph_count_isolated = False
             if self.fullgraph:
                 prior_error_on_nested_compile = set_fullgraph_error_on_nested_compile(
                     torch._dynamo.config.error_on_dynamo_callback_in_fullgraph_compiled_code
                 )
                 if not self.export:
-                    fullgraph_count_enabled = set_fullgraph_compiled_frame_count(0) < 0
+                    prior_fullgraph_count = set_fullgraph_compiled_frame_count(0)
+                    fullgraph_count_enabled = prior_fullgraph_count < 0
                     if fullgraph_count_enabled:
+                        reset_skip_reasons()
+                    elif prior_fullgraph_count > 0:
+                        # Keep nested torch.compile(fullgraph=True) calls from
+                        # contributing frames to the outer fullgraph count, but
+                        # leave a local counter active so compiled nested code
+                        # still masks recursive Dynamo callbacks as before.
+                        prior_isolated_fullgraph_count = prior_fullgraph_count
+                        prior_skip_reasons = dynamo_tls.skip_reasons
+                        fullgraph_count_isolated = True
+                        # Deactivate before reactivating because the C++ setter
+                        # intentionally ignores active-to-active transitions.
+                        set_fullgraph_compiled_frame_count(-1)
+                        set_fullgraph_compiled_frame_count(0)
                         reset_skip_reasons()
             try:
                 # We shouldn't compile inside kernel invocation.
@@ -1184,28 +1201,33 @@ class _TorchDynamoContext:
                     finally:
                         # Restore the dynamic layer stack depth if necessary.
                         set_eval_frame(None)
-                        if fullgraph_count_enabled and call_succeeded:
+                        fullgraph_error: RuntimeError | None = None
+                        if (
+                            fullgraph_count_enabled or fullgraph_count_isolated
+                        ) and call_succeeded:
                             count = set_fullgraph_compiled_frame_count(-1)
-                            if count == 0 and _stance.stance == "default":
-                                skip_reasons = get_skip_reasons()
-                                msg = "torch.compile with fullgraph=True found no compiled frames."
-                                if skip_reasons:
-                                    reasons_str = "\n".join(
-                                        f"  - {r}" for r in skip_reasons
+                            if _stance.stance == "default":
+                                if count == 0:
+                                    skip_reasons = get_skip_reasons()
+                                    msg = "torch.compile with fullgraph=True found no compiled frames."
+                                    if skip_reasons:
+                                        reasons_str = "\n".join(
+                                            f"  - {r}" for r in skip_reasons
+                                        )
+                                        msg += f" Skipped frames:\n{reasons_str}"
+                                    else:
+                                        msg += (
+                                            " Compilation was not attempted and no cached compiled"
+                                            " code was found."
+                                        )
+                                    fullgraph_error = RuntimeError(msg)
+                                if count > 1:
+                                    fullgraph_error = RuntimeError(
+                                        "torch.compile with fullgraph=True expected exactly one "
+                                        f"compiled frame, but found {count} compiled frames."
                                     )
-                                    msg += f" Skipped frames:\n{reasons_str}"
-                                else:
-                                    msg += (
-                                        " Compilation was not attempted and no cached compiled"
-                                        " code was found."
-                                    )
-                                raise RuntimeError(msg)
                         if prior_error_on_graph_break is not None:
                             _set_error_on_graph_break(prior_error_on_graph_break)
-                        if prior_error_on_nested_compile is not None:
-                            set_fullgraph_error_on_nested_compile(
-                                prior_error_on_nested_compile
-                            )
                         torch._C._functorch.pop_dynamic_layer_stack_and_undo_to_depth(
                             saved_dynamic_layer_stack_depth
                         )
@@ -1216,11 +1238,19 @@ class _TorchDynamoContext:
                         )
                         for cleanup in cleanups:
                             cleanup()
+                        if fullgraph_error is not None:
+                            raise fullgraph_error
                 return result
             finally:
                 if fullgraph_count_enabled:
                     set_fullgraph_compiled_frame_count(-1)
                     dynamo_tls.skip_reasons = None
+                elif prior_isolated_fullgraph_count is not None:
+                    set_fullgraph_compiled_frame_count(-1)
+                    set_fullgraph_compiled_frame_count(prior_isolated_fullgraph_count)
+                    dynamo_tls.skip_reasons = prior_skip_reasons
+                if prior_error_on_nested_compile is not None:
+                    set_fullgraph_error_on_nested_compile(prior_error_on_nested_compile)
                 _maybe_set_eval_frame(prior)
 
         # hooks to properly handle inlining
