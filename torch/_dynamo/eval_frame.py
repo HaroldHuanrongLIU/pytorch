@@ -1426,14 +1426,19 @@ class DisableContext(_TorchDynamoContext):
                 _maybe_set_eval_frame(_callback_from_stance(self.callback))
                 try:
                     fn_name = getattr(fn, "__name__", type(fn).__name__)
-                    # Skip annotation for __torch_dispatch__ to avoid polluting
-                    # node metadata during export. The disable on __torch_dispatch__
-                    # is an internal implementation detail, not user-facing.
+                    # Skip annotation for PyTorch-internal tracing/dispatch hooks to
+                    # avoid polluting node metadata during export. These disables are
+                    # internal implementation details, not user-facing.
                     # TODO: Ideally we shouldn't need this check because nested
                     # annotate() calls shouldn't override existing keys.
+                    fn_module = getattr(fn, "__module__", "") or ""
+                    is_torch_internal = fn_module == "torch" or fn_module.startswith(
+                        "torch."
+                    )
                     if (
                         torch.compiler.is_exporting()
                         and fn_name != "__torch_dispatch__"
+                        and not is_torch_internal
                     ):
                         with fx_traceback.annotate(
                             {
