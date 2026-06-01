@@ -107,7 +107,6 @@ from .runtime import autotune_cache
 from .runtime.autotune_cache import AutotuneCacheBundler
 from .sizevars import SizeVarAllocator
 from .utils import (
-    convert_shape_to_inductor,
     gather_origins,
     get_cloned_parameter_buffer_name,
     get_donated_idxs,
@@ -587,7 +586,7 @@ class GraphLowering(torch.fx.Interpreter):
     def freeze_runtime_asserts(self) -> None:
         self._shape_env.freeze_runtime_asserts()
 
-    def symbolic_sizes_strides(
+    def get_placeholder_sizes_strides(
         self, ex: torch.Tensor
     ) -> tuple[Sequence[int | Expr], Sequence[int | Expr]]:
         """
@@ -596,9 +595,7 @@ class GraphLowering(torch.fx.Interpreter):
         have the same size they get assigned the same symbolic variable.
         """
         if self.reuse_shape_env:
-            return convert_shape_to_inductor(ex.size()), convert_shape_to_inductor(
-                ex.stride()
-            )
+            size, stride = ex.size(), ex.stride()
         else:
             from torch._dynamo.source import ConstantSource
 
@@ -611,19 +608,15 @@ class GraphLowering(torch.fx.Interpreter):
             source = ConstantSource(
                 f"__inductor_unknown_tensor_{len(self._shape_env.backed_var_to_val)}"
             )
-            (
-                size,
-                stride,
-                _,
-            ) = self._shape_env.transfer_symbols_from_foreign_shape_env(
+            size, stride, _ = self._shape_env.transfer_symbols_from_foreign_shape_env(
                 ex.size(),
                 ex.stride(),
                 ex.storage_offset(),
                 source,
             )
 
-        r_size = [i.node.expr if isinstance(i, torch.SymInt) else i for i in size]
-        r_stride = [i.node.expr if isinstance(i, torch.SymInt) else i for i in stride]
+        r_size = [sympy.sympify(i) for i in size]
+        r_stride = [sympy.sympify(i) for i in stride]
         return r_size, r_stride
 
     def static_sizes_strides(
@@ -1298,7 +1291,7 @@ class GraphLowering(torch.fx.Interpreter):
             # the first N inputs are weights
             sizes, strides = self.static_sizes_strides(example)
         else:
-            sizes, strides = self.symbolic_sizes_strides(example)  # type: ignore[assignment]
+            sizes, strides = self.get_placeholder_sizes_strides(example)  # type: ignore[assignment]
 
         if (
             self.is_backward
